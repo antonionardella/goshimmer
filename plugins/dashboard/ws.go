@@ -48,7 +48,7 @@ func configureWebSocketWorkerPool() {
 		broadcastWsMessage(&wsmsg{MsgTypeMPSMetric, task.Param(0).(uint64)})
 		broadcastWsMessage(&wsmsg{MsgTypeNodeStatus, currentNodeStatus()})
 		broadcastWsMessage(&wsmsg{MsgTypeNeighborMetric, neighborMetrics()})
-		broadcastWsMessage(&wsmsg{MsgTypeTipsMetric, messagelayer.TipSelector.TipCount()})
+		broadcastWsMessage(&wsmsg{MsgTypeTipsMetric, messagelayer.TipSelector().TipCount()})
 		task.Return(nil)
 	}, workerpool.WorkerCount(wsSendWorkerCount), workerpool.QueueSize(wsSendWorkerQueueSize))
 }
@@ -58,7 +58,7 @@ func runWebSocketStreams() {
 		wsSendWorkerPool.TrySubmit(mps)
 	})
 
-	daemon.BackgroundWorker("Dashboard[StatusUpdate]", func(shutdownSignal <-chan struct{}) {
+	if err := daemon.BackgroundWorker("Dashboard[StatusUpdate]", func(shutdownSignal <-chan struct{}) {
 		metrics.Events.ReceivedMPSUpdated.Attach(updateStatus)
 		wsSendWorkerPool.Start()
 		<-shutdownSignal
@@ -66,7 +66,9 @@ func runWebSocketStreams() {
 		metrics.Events.ReceivedMPSUpdated.Detach(updateStatus)
 		wsSendWorkerPool.Stop()
 		log.Info("Stopping Dashboard[StatusUpdate] ... done")
-	}, shutdown.PriorityDashboard)
+	}, shutdown.PriorityDashboard); err != nil {
+		log.Panicf("Failed to start as daemon: %s", err)
+	}
 }
 
 // reigsters and creates a new websocket client.

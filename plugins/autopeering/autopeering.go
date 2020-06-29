@@ -1,7 +1,6 @@
 package autopeering
 
 import (
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -21,6 +20,7 @@ import (
 	"github.com/iotaledger/hive.go/crypto/ed25519"
 	"github.com/iotaledger/hive.go/identity"
 	"github.com/iotaledger/hive.go/logger"
+	"github.com/mr-tron/base58"
 )
 
 // autopeering constants
@@ -33,8 +33,11 @@ var (
 	// ErrParsingMasterNode is returned for an invalid master node.
 	ErrParsingMasterNode = errors.New("cannot parse master node")
 
-	// NetworkID specifies the autopeering network identifier
-	NetworkID = hash32([]byte(banner.AppVersion + NetworkVersion))
+	// networkID specifies the autopeering network identifier.
+	networkID = hash32([]byte(banner.AppVersion + NetworkVersion))
+
+	// Conn contains the network connection.
+	Conn *NetConnMetric
 )
 
 var (
@@ -53,6 +56,11 @@ var (
 	}{c: make(chan *server.Server, 1)}
 )
 
+// NetworkID gets the networkID.
+func NetworkID() uint32 {
+	return networkID
+}
+
 // Discovery returns the peer discovery instance.
 func Discovery() *discover.Protocol {
 	peerDiscOnce.Do(createPeerDisc)
@@ -68,7 +76,7 @@ func Selection() *selection.Protocol {
 // BindAddress returns the string form of the autopeering bind address.
 func BindAddress() string {
 	peering := local.GetInstance().Services().Get(service.PeeringKey)
-	host := config.Node.GetString(local.CfgBind)
+	host := config.Node().GetString(local.CfgBind)
 	port := strconv.Itoa(peering.Port())
 	return net.JoinHostPort(host, port)
 }
@@ -94,7 +102,7 @@ func createPeerDisc() {
 	}
 	log.Debugf("Master peers: %v", masterPeers)
 
-	peerDisc = discover.New(local.GetInstance(), ProtocolVersion, NetworkID,
+	peerDisc = discover.New(local.GetInstance(), ProtocolVersion, networkID,
 		discover.Logger(log),
 		discover.MasterPeers(masterPeers),
 	)
@@ -142,8 +150,10 @@ func start(shutdownSignal <-chan struct{}) {
 	}
 	defer conn.Close()
 
+	Conn = &NetConnMetric{UDPConn: conn}
+
 	// start a server doing peerDisc and peering
-	srv := server.Serve(lPeer, conn, log.Named("srv"), Discovery(), Selection())
+	srv := server.Serve(lPeer, Conn, log.Named("srv"), Discovery(), Selection())
 	defer srv.Close()
 
 	// start the peer discovery on that connection
@@ -159,8 +169,7 @@ func start(shutdownSignal <-chan struct{}) {
 	Discovery().Close()
 	Selection().Close()
 
-	// persists potential peering seeds for the next start
-	log.Infof("%d peers persisted as seeds", lPeer.Database().PersistSeeds())
+	lPeer.Database().Close()
 }
 
 func hash32(b []byte) uint32 {
@@ -173,7 +182,7 @@ func hash32(b []byte) uint32 {
 }
 
 func parseEntryNodes() (result []*peer.Peer, err error) {
-	for _, entryNodeDefinition := range config.Node.GetStringSlice(CfgEntryNodes) {
+	for _, entryNodeDefinition := range config.Node().GetStringSlice(CfgEntryNodes) {
 		if entryNodeDefinition == "" {
 			continue
 		}
@@ -182,7 +191,7 @@ func parseEntryNodes() (result []*peer.Peer, err error) {
 		if len(parts) != 2 {
 			return nil, fmt.Errorf("%w: master node parts must be 2, is %d", ErrParsingMasterNode, len(parts))
 		}
-		pubKey, err := base64.StdEncoding.DecodeString(parts[0])
+		pubKey, err := base58.Decode(parts[0])
 		if err != nil {
 			return nil, fmt.Errorf("%w: invalid public key: %s", ErrParsingMasterNode, err)
 		}

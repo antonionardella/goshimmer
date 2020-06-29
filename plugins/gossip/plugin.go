@@ -1,6 +1,8 @@
 package gossip
 
 import (
+	"sync"
+
 	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/message"
 	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/tangle"
 	"github.com/iotaledger/goshimmer/packages/gossip"
@@ -19,11 +21,20 @@ import (
 const PluginName = "Gossip"
 
 var (
-	// Plugin is the plugin instance of the gossip plugin.
-	Plugin = node.NewPlugin(PluginName, node.Enabled, configure, run)
+	// plugin is the plugin instance of the gossip plugin.
+	plugin *node.Plugin
+	once   sync.Once
 
 	log *logger.Logger
 )
+
+// Plugin gets the plugin instance.
+func Plugin() *node.Plugin {
+	once.Do(func() {
+		plugin = node.NewPlugin(PluginName, node.Enabled, configure, run)
+	})
+	return plugin
+}
 
 func configure(*node.Plugin) {
 	log = logger.NewLogger(PluginName)
@@ -35,7 +46,7 @@ func configure(*node.Plugin) {
 
 func run(*node.Plugin) {
 	if err := daemon.BackgroundWorker(PluginName, start, shutdown.PriorityGossip); err != nil {
-		log.Errorf("Failed to start as daemon: %s", err)
+		log.Panicf("Failed to start as daemon: %s", err)
 	}
 }
 
@@ -77,8 +88,8 @@ func configureAutopeering() {
 	mgr.Events().ConnectionFailed.Attach(events.NewClosure(func(p *peer.Peer, _ error) {
 		peerSel.RemoveNeighbor(p.ID())
 	}))
-	mgr.Events().NeighborRemoved.Attach(events.NewClosure(func(p *peer.Peer) {
-		peerSel.RemoveNeighbor(p.ID())
+	mgr.Events().NeighborRemoved.Attach(events.NewClosure(func(n *gossip.Neighbor) {
+		peerSel.RemoveNeighbor(n.ID())
 	}))
 }
 
@@ -93,8 +104,8 @@ func configureLogging() {
 	mgr.Events().NeighborAdded.Attach(events.NewClosure(func(n *gossip.Neighbor) {
 		log.Infof("Neighbor added: %s / %s", gossip.GetAddress(n.Peer), n.ID())
 	}))
-	mgr.Events().NeighborRemoved.Attach(events.NewClosure(func(p *peer.Peer) {
-		log.Infof("Neighbor removed: %s / %s", gossip.GetAddress(p), p.ID())
+	mgr.Events().NeighborRemoved.Attach(events.NewClosure(func(n *gossip.Neighbor) {
+		log.Infof("Neighbor removed: %s / %s", gossip.GetAddress(n.Peer), n.ID())
 	}))
 }
 
@@ -104,11 +115,11 @@ func configureMessageLayer() {
 
 	// configure flow of incoming messages
 	mgr.Events().MessageReceived.Attach(events.NewClosure(func(event *gossip.MessageReceivedEvent) {
-		messagelayer.MessageParser.Parse(event.Data, event.Peer)
+		messagelayer.MessageParser().Parse(event.Data, event.Peer)
 	}))
 
 	// configure flow of outgoing messages (gossip on solidification)
-	messagelayer.Tangle.Events.MessageSolid.Attach(events.NewClosure(func(cachedMessage *message.CachedMessage, cachedMessageMetadata *tangle.CachedMessageMetadata) {
+	messagelayer.Tangle().Events.MessageSolid.Attach(events.NewClosure(func(cachedMessage *message.CachedMessage, cachedMessageMetadata *tangle.CachedMessageMetadata) {
 		cachedMessageMetadata.Release()
 		cachedMessage.Consume(func(msg *message.Message) {
 			mgr.SendMessage(msg.Bytes())
@@ -116,7 +127,7 @@ func configureMessageLayer() {
 	}))
 
 	// request missing messages
-	messagelayer.MessageRequester.Events.SendRequest.Attach(events.NewClosure(func(messageId message.Id) {
+	messagelayer.MessageRequester().Events.SendRequest.Attach(events.NewClosure(func(messageId message.Id) {
 		mgr.RequestMessage(messageId[:])
 	}))
 }

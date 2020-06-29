@@ -4,11 +4,16 @@ import (
 	"github.com/iotaledger/hive.go/marshalutil"
 )
 
+const (
+	// ObjectName defines the name of the data object.
+	ObjectName = "data"
+)
+
 func init() {
 	// register the generic unmarshaler
 	SetGenericUnmarshalerFactory(GenericPayloadUnmarshalerFactory)
 	// register the generic data payload type
-	RegisterType(DataType, GenericPayloadUnmarshalerFactory(DataType))
+	RegisterType(DataType, ObjectName, GenericPayloadUnmarshalerFactory(DataType))
 }
 
 // Payload represents some kind of payload of data which only gains meaning by having
@@ -46,9 +51,15 @@ func FromBytes(bytes []byte) (result Payload, consumedBytes int, err error) {
 		return
 	}
 
+	readOffset := marshalUtil.ReadOffset()
 	result, err = GetUnmarshaler(payloadType)(payloadBytes)
 	if err != nil {
-		return
+		// fallback to the generic unmarshaler if registered type fails to unmarshal
+		marshalUtil.ReadSeek(readOffset)
+		result, err = GenericPayloadUnmarshalerFactory(payloadType)(payloadBytes)
+		if err != nil {
+			return
+		}
 	}
 
 	// return the number of bytes we processed

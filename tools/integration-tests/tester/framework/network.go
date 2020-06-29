@@ -2,8 +2,6 @@ package framework
 
 import (
 	"context"
-	"crypto/ed25519"
-	"encoding/base64"
 	"fmt"
 	"log"
 	"math/rand"
@@ -11,7 +9,8 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
-	hive_ed25519 "github.com/iotaledger/hive.go/crypto/ed25519"
+	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/wallet"
+	"github.com/iotaledger/hive.go/crypto/ed25519"
 	"github.com/iotaledger/hive.go/identity"
 )
 
@@ -26,6 +25,8 @@ type Network struct {
 
 	entryNode         *DockerContainer
 	entryNodeIdentity *identity.Identity
+
+	partitions []*Partition
 
 	dockerClient *client.Client
 }
@@ -55,13 +56,13 @@ func newNetwork(dockerClient *client.Client, name string, tester *DockerContaine
 // createEntryNode creates the network's entry node.
 func (n *Network) createEntryNode() error {
 	// create identity
-	publicKey, privateKey, err := hive_ed25519.GenerateKey()
+	publicKey, privateKey, err := ed25519.GenerateKey()
 	if err != nil {
 		return err
 	}
 
 	n.entryNodeIdentity = identity.New(publicKey)
-	seed := base64.StdEncoding.EncodeToString(ed25519.PrivateKey(privateKey.Bytes()).Seed())
+	seed := privateKey.Seed().String()
 
 	// create entry node container
 	n.entryNode = NewDockerContainer(n.dockerClient)
@@ -87,11 +88,11 @@ func (n *Network) CreatePeer(c GoShimmerConfig) (*Peer, error) {
 	name := n.namePrefix(fmt.Sprintf("%s%d", containerNameReplica, len(n.peers)))
 
 	// create identity
-	publicKey, privateKey, err := hive_ed25519.GenerateKey()
+	publicKey, privateKey, err := ed25519.GenerateKey()
 	if err != nil {
 		return nil, err
 	}
-	seed := base64.StdEncoding.EncodeToString(ed25519.PrivateKey(privateKey.Bytes()).Seed())
+	seed := privateKey.Seed().String()
 
 	config := c
 	config.Name = name
@@ -99,6 +100,15 @@ func (n *Network) CreatePeer(c GoShimmerConfig) (*Peer, error) {
 	config.EntryNodeHost = n.namePrefix(containerNameEntryNode)
 	config.EntryNodePublicKey = n.entryNodePublicKey()
 	config.DisabledPlugins = disabledPluginsPeer
+	config.SnapshotFilePath = snapshotFilePath
+
+	// create wallet
+	var nodeWallet *wallet.Wallet
+	if c.Faucet == true {
+		nodeWallet = wallet.New(genesisSeed)
+	} else {
+		nodeWallet = wallet.New()
+	}
 
 	// create Docker container
 	container := NewDockerContainer(n.dockerClient)
@@ -115,7 +125,10 @@ func (n *Network) CreatePeer(c GoShimmerConfig) (*Peer, error) {
 		return nil, err
 	}
 
-	peer := newPeer(name, identity.New(publicKey), container)
+	peer, err := newPeer(name, identity.New(publicKey), container, nodeWallet, n)
+	if err != nil {
+		return nil, err
+	}
 	n.peers = append(n.peers, peer)
 	return peer, nil
 }
@@ -133,6 +146,12 @@ func (n *Network) Shutdown() error {
 		if err != nil {
 			return err
 		}
+	}
+
+	// delete all partitions
+	err = n.DeletePartitions()
+	if err != nil {
+		return err
 	}
 
 	// retrieve logs
@@ -208,6 +227,10 @@ func (n *Network) WaitForAutopeering(minimumNeighbors int) error {
 	log.Printf("Waiting for autopeering...\n")
 	defer log.Printf("Waiting for autopeering... done\n")
 
+	if minimumNeighbors == 0 {
+		return nil
+	}
+
 	for i := autopeeringMaxTries; i > 0; i-- {
 
 		for _, p := range n.peers {
@@ -245,9 +268,9 @@ func (n *Network) namePrefix(suffix string) string {
 	return fmt.Sprintf("%s-%s", n.name, suffix)
 }
 
-// entryNodePublicKey returns the entry node's public key encoded as base64
+// entryNodePublicKey returns the entry node's public key encoded as base58
 func (n *Network) entryNodePublicKey() string {
-	return base64.StdEncoding.EncodeToString(n.entryNodeIdentity.PublicKey().Bytes())
+	return n.entryNodeIdentity.PublicKey().String()
 }
 
 // Peers returns all available peers in the network.
@@ -258,4 +281,148 @@ func (n *Network) Peers() []*Peer {
 // RandomPeer returns a random peer out of the list of peers.
 func (n *Network) RandomPeer() *Peer {
 	return n.peers[rand.Intn(len(n.peers))]
+}
+
+// createPumba creates and starts a Pumba Docker container.
+func (n *Network) createPumba(name string, containerName string, targetIPs []string) (*DockerContainer, error) {
+	container := NewDockerContainer(n.dockerClient)
+	err := container.CreatePumba(name, containerName, targetIPs)
+	if err != nil {
+		return nil, err
+	}
+	err = container.Start()
+	if err != nil {
+		return nil, err
+	}
+
+	return container, nil
+}
+
+// createPartition creates a partition with the given peers.
+// It starts a Pumba container for every peer that blocks traffic to all other partitions.
+func (n *Network) createPartition(peers []*Peer) (*Partition, error) {
+	peersMap := make(map[string]*Peer)
+	for _, peer := range peers {
+		peersMap[peer.ID().String()] = peer
+	}
+
+	// block all traffic to all other peers except in the current partition
+	var targetIPs []string
+	for _, peer := range n.peers {
+		if _, ok := peersMap[peer.ID().String()]; ok {
+			continue
+		}
+		targetIPs = append(targetIPs, peer.ip)
+	}
+
+	partitionName := n.namePrefix(fmt.Sprintf("partition_%d-", len(n.partitions)))
+
+	// create pumba container for every peer in the partition
+	pumbas := make([]*DockerContainer, len(peers))
+	for i, p := range peers {
+		name := partitionName + p.name + containerNameSuffixPumba
+		pumba, err := n.createPumba(name, p.name, targetIPs)
+		if err != nil {
+			return nil, err
+		}
+		pumbas[i] = pumba
+		time.Sleep(1 * time.Second)
+	}
+
+	partition := &Partition{
+		name:     partitionName,
+		peers:    peers,
+		peersMap: peersMap,
+		pumbas:   pumbas,
+	}
+	n.partitions = append(n.partitions, partition)
+
+	return partition, nil
+}
+
+// DeletePartitions deletes all partitions of the network.
+// All nodes can communicate with the full network again.
+func (n *Network) DeletePartitions() error {
+	for _, p := range n.partitions {
+		err := p.deletePartition()
+		if err != nil {
+			return err
+		}
+	}
+	n.partitions = nil
+	return nil
+}
+
+// Partitions returns the network's partitions.
+func (n *Network) Partitions() []*Partition {
+	return n.partitions
+}
+
+// Split splits the existing network in given partitions.
+func (n *Network) Split(partitions ...[]*Peer) error {
+	for _, peers := range partitions {
+		_, err := n.createPartition(peers)
+		if err != nil {
+			return err
+		}
+	}
+	// wait until pumba containers are started and block traffic between partitions
+	time.Sleep(5 * time.Second)
+
+	return nil
+}
+
+// Partition represents a network partition.
+// It contains its peers and the corresponding Pumba instances that block all traffic to peers in other partitions.
+type Partition struct {
+	name     string
+	peers    []*Peer
+	peersMap map[string]*Peer
+	pumbas   []*DockerContainer
+}
+
+// Peers returns the partition's peers.
+func (p *Partition) Peers() []*Peer {
+	return p.peers
+}
+
+// PeersMap returns the partition's peers map.
+func (p *Partition) PeersMap() map[string]*Peer {
+	return p.peersMap
+}
+
+func (p *Partition) String() string {
+	return fmt.Sprintf("Partition{%s, %s}", p.name, p.peers)
+}
+
+// deletePartition deletes a partition, all its Pumba containers and creates logs for them.
+func (p *Partition) deletePartition() error {
+	// stop containers
+	for _, pumba := range p.pumbas {
+		err := pumba.Stop()
+		if err != nil {
+			return err
+		}
+	}
+
+	// retrieve logs
+	for i, pumba := range p.pumbas {
+		logs, err := pumba.Logs()
+		if err != nil {
+			return err
+		}
+		err = createLogFile(fmt.Sprintf("%s%s", p.name, p.peers[i].name), logs)
+		if err != nil {
+			return err
+		}
+	}
+
+	for _, pumba := range p.pumbas {
+		err := pumba.Remove()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

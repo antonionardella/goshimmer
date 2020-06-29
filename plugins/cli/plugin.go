@@ -3,33 +3,44 @@ package cli
 import (
 	"fmt"
 	"os"
+	"sync"
 
+	"github.com/iotaledger/goshimmer/plugins/banner"
 	"github.com/iotaledger/hive.go/events"
 	"github.com/iotaledger/hive.go/node"
 	flag "github.com/spf13/pflag"
-
-	"github.com/iotaledger/goshimmer/plugins/banner"
 )
 
 // PluginName is the name of the CLI plugin.
 const PluginName = "CLI"
 
 var (
-	// Plugin is the plugin instance of the CLI plugin.
-	Plugin  = node.NewPlugin(PluginName, node.Enabled)
+	// plugin is the plugin instance of the CLI plugin.
+	plugin  *node.Plugin
+	once    sync.Once
 	version = flag.BoolP("version", "v", false, "Prints the GoShimmer version")
 )
 
+// Plugin gets the plugin instance.
+func Plugin() *node.Plugin {
+	once.Do(func() {
+		plugin = node.NewPlugin(PluginName, node.Enabled)
+	})
+	return plugin
+}
+
 func init() {
-	for name, status := range node.GetPlugins() {
-		onAddPlugin(name, status)
+	plugin = Plugin()
+
+	for name, plugin := range node.GetPlugins() {
+		onAddPlugin(name, plugin.Status)
 	}
 
 	node.Events.AddPlugin.Attach(events.NewClosure(onAddPlugin))
 
 	flag.Usage = printUsage
 
-	Plugin.Events.Init.Attach(events.NewClosure(onInit))
+	plugin.Events.Init.Attach(events.NewClosure(onInit))
 }
 
 func onAddPlugin(name string, status int) {

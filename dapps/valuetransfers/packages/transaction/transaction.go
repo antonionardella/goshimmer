@@ -1,6 +1,7 @@
 package transaction
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
@@ -206,6 +207,7 @@ func (transaction *Transaction) EssenceBytes() []byte {
 
 	// store marshaled result
 	transaction.essenceBytes = marshalUtil.Bytes()
+	transaction.SetModified()
 
 	return transaction.essenceBytes
 }
@@ -273,8 +275,18 @@ func (transaction *Transaction) Bytes() []byte {
 // Sign adds a new signature to the Transaction.
 func (transaction *Transaction) Sign(signature signaturescheme.SignatureScheme) *Transaction {
 	transaction.signatures.Add(signature.Address(), signature.Sign(transaction.EssenceBytes()))
-
+	transaction.SetModified()
 	return transaction
+}
+
+// PutSignature validates and adds signature to the transaction
+func (transaction *Transaction) PutSignature(signature signaturescheme.Signature) error {
+	if !signature.IsValid(transaction.EssenceBytes()) {
+		return errors.New("PutSignature: invalid signature")
+	}
+	transaction.signatures.Add(signature.Address(), signature)
+	transaction.SetModified()
+	return nil
 }
 
 // String returns a human readable version of this Transaction (for debug purposes).
@@ -286,7 +298,7 @@ func (transaction *Transaction) String() string {
 		stringify.StructField("inputs", transaction.inputs),
 		stringify.StructField("outputs", transaction.outputs),
 		stringify.StructField("signatures", transaction.signatures),
-		stringify.StructField("dataPayloadSize", transaction.DataPayloadSize()),
+		stringify.StructField("dataPayloadSize", uint64(transaction.DataPayloadSize())),
 	)
 }
 
@@ -425,7 +437,7 @@ func (cachedTransaction *CachedTransaction) Retain() *CachedTransaction {
 
 // Consume  overrides the underlying method to use a CachedTransaction object instead of a generic CachedObject in the
 // consumer).
-func (cachedTransaction *CachedTransaction) Consume(consumer func(metadata *Transaction)) bool {
+func (cachedTransaction *CachedTransaction) Consume(consumer func(tx *Transaction)) bool {
 	return cachedTransaction.CachedObject.Consume(func(object objectstorage.StorableObject) {
 		consumer(object.(*Transaction))
 	})

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -63,7 +64,7 @@ func (d *DockerContainer) CreateGoShimmerEntryNode(name string, seed string) err
 			"--logger.level=debug",
 			fmt.Sprintf("--node.disablePlugins=%s", disabledPluginsEntryNode),
 			"--autopeering.entryNodes=",
-			fmt.Sprintf("--autopeering.seed=%s", seed),
+			fmt.Sprintf("--autopeering.seed=base58:%s", seed),
 		},
 	}
 
@@ -81,16 +82,32 @@ func (d *DockerContainer) CreateGoShimmerPeer(config GoShimmerConfig) error {
 		Cmd: strslice.StrSlice{
 			"--skip-config=true",
 			"--logger.level=debug",
+			fmt.Sprintf("--valueLayer.fcob.averageNetworkDelay=%d", ParaFCoBAverageNetworkDelay),
+			fmt.Sprintf("--autopeering.outboundUpdateIntervalMs=%d", ParaOutboundUpdateIntervalMs),
 			fmt.Sprintf("--node.disablePlugins=%s", config.DisabledPlugins),
+			fmt.Sprintf("--pow.difficulty=%d", ParaPoWDifficulty),
 			fmt.Sprintf("--node.enablePlugins=%s", func() string {
+				var plugins []string
 				if config.Bootstrap {
-					return "Bootstrap"
+					plugins = append(plugins, "Bootstrap")
 				}
-				return ""
+				if config.Faucet {
+					plugins = append(plugins, "faucet")
+				}
+				return strings.Join(plugins[:], ",")
 			}()),
+			// define the faucet seed in case the faucet dApp is enabled
+			func() string {
+				if !config.Faucet {
+					return ""
+				}
+				return fmt.Sprintf("--faucet.seed=%s", genesisSeedBase58)
+			}(),
+			fmt.Sprintf("--faucet.tokensPerRequest=%d", ParaFaucetTokensPerRequest),
+			fmt.Sprintf("--valueLayer.snapshot.file=%s", config.SnapshotFilePath),
 			fmt.Sprintf("--bootstrap.initialIssuance.timePeriodSec=%d", config.BootstrapInitialIssuanceTimePeriodSec),
 			"--webapi.bindAddress=0.0.0.0:8080",
-			fmt.Sprintf("--autopeering.seed=%s", config.Seed),
+			fmt.Sprintf("--autopeering.seed=base58:%s", config.Seed),
 			fmt.Sprintf("--autopeering.entryNodes=%s@%s:14626", config.EntryNodePublicKey, config.EntryNodeHost),
 			fmt.Sprintf("--drng.instanceId=%d", config.DRNGInstance),
 			fmt.Sprintf("--drng.threshold=%d", config.DRNGThreshold),
@@ -99,7 +116,9 @@ func (d *DockerContainer) CreateGoShimmerPeer(config GoShimmerConfig) error {
 		},
 	}
 
-	return d.CreateContainer(config.Name, containerConfig)
+	return d.CreateContainer(config.Name, containerConfig, &container.HostConfig{
+		Binds: []string{"goshimmer-testing-assets:/assets:rw"},
+	})
 }
 
 // CreateDrandMember creates a new container with the drand configuration.
@@ -122,9 +141,47 @@ func (d *DockerContainer) CreateDrandMember(name string, goShimmerAPI string, le
 	return d.CreateContainer(name, containerConfig)
 }
 
+// CreatePumba creates a new container with Pumba configuration.
+func (d *DockerContainer) CreatePumba(name string, containerName string, targetIPs []string) error {
+	hostConfig := &container.HostConfig{
+		Binds: strslice.StrSlice{"/var/run/docker.sock:/var/run/docker.sock:ro"},
+	}
+
+	cmd := strslice.StrSlice{
+		"--log-level=debug",
+		"netem",
+		"--duration=100m",
+	}
+
+	for _, ip := range targetIPs {
+		targetFlag := "--target=" + ip
+		cmd = append(cmd, targetFlag)
+	}
+
+	slice := strslice.StrSlice{
+		"--tc-image=gaiadocker/iproute2",
+		"loss",
+		"--percent=100",
+		containerName,
+	}
+	cmd = append(cmd, slice...)
+
+	containerConfig := &container.Config{
+		Image: "gaiaadm/pumba:0.7.2",
+		Cmd:   cmd,
+	}
+
+	return d.CreateContainer(name, containerConfig, hostConfig)
+}
+
 // CreateContainer creates a new container with the given configuration.
-func (d *DockerContainer) CreateContainer(name string, containerConfig *container.Config) error {
-	resp, err := d.client.ContainerCreate(context.Background(), containerConfig, nil, nil, name)
+func (d *DockerContainer) CreateContainer(name string, containerConfig *container.Config, hostConfigs ...*container.HostConfig) error {
+	var hostConfig *container.HostConfig
+	if len(hostConfigs) > 0 {
+		hostConfig = hostConfigs[0]
+	}
+
+	resp, err := d.client.ContainerCreate(context.Background(), containerConfig, hostConfig, nil, name)
 	if err != nil {
 		return err
 	}
@@ -168,6 +225,22 @@ func (d *DockerContainer) ExitStatus() (int, error) {
 	}
 
 	return resp.State.ExitCode, nil
+}
+
+// IP returns the IP address according to the container information for the given network.
+func (d *DockerContainer) IP(network string) (string, error) {
+	resp, err := d.client.ContainerInspect(context.Background(), d.id)
+	if err != nil {
+		return "", err
+	}
+
+	for name, v := range resp.NetworkSettings.Networks {
+		if name == network {
+			return v.IPAddress, nil
+		}
+	}
+
+	return "", fmt.Errorf("IP address in %s could not be determined", network)
 }
 
 // Logs returns the logs of the container as io.ReadCloser.

@@ -1,93 +1,181 @@
 package valuetransfers
 
 import (
+	"os"
+	"sync"
 	"time"
 
+	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/consensus"
+	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/payload"
+	valuepayload "github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/payload"
+	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/tangle"
+	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/tipmanager"
+	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/message"
+	messageTangle "github.com/iotaledger/goshimmer/packages/binary/messagelayer/tangle"
+	"github.com/iotaledger/goshimmer/packages/shutdown"
+	"github.com/iotaledger/goshimmer/packages/vote"
+	"github.com/iotaledger/goshimmer/plugins/config"
+	"github.com/iotaledger/goshimmer/plugins/database"
+	"github.com/iotaledger/goshimmer/plugins/messagelayer"
 	"github.com/iotaledger/hive.go/daemon"
 	"github.com/iotaledger/hive.go/events"
 	"github.com/iotaledger/hive.go/logger"
 	"github.com/iotaledger/hive.go/node"
-
-	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/branchmanager"
-	valuepayload "github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/payload"
-	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/tangle"
-	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/transaction"
-	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/message"
-	messageTangle "github.com/iotaledger/goshimmer/packages/binary/messagelayer/tangle"
-	"github.com/iotaledger/goshimmer/packages/database"
-	"github.com/iotaledger/goshimmer/packages/shutdown"
-	"github.com/iotaledger/goshimmer/packages/vote"
-	"github.com/iotaledger/goshimmer/plugins/messagelayer"
+	flag "github.com/spf13/pflag"
 )
 
 const (
 	// PluginName contains the human readable name of the plugin.
 	PluginName = "ValueTransfers"
 
-	// AverageNetworkDelay contains the average time it takes for a network to propagate through gossip.
-	AverageNetworkDelay = 6 * time.Second
+	// DefaultAverageNetworkDelay contains the default average time it takes for a network to propagate through gossip.
+	DefaultAverageNetworkDelay = 5 * time.Second
+
+	// CfgValueLayerSnapshotFile is the path to the snapshot file.
+	CfgValueLayerSnapshotFile = "valueLayer.snapshot.file"
+
+	// CfgValueLayerFCOBAverageNetworkDelay is the avg. network delay to use for FCoB rules
+	CfgValueLayerFCOBAverageNetworkDelay = "valueLayer.fcob.averageNetworkDelay"
 )
 
+func init() {
+	flag.String(CfgValueLayerSnapshotFile, "", "the path to the snapshot file")
+	flag.Int(CfgValueLayerFCOBAverageNetworkDelay, 5, "the avg. network delay to use for FCoB rules")
+}
+
 var (
-	// App is the "plugin" instance of the value-transfers application.
-	App = node.NewPlugin(PluginName, node.Enabled, configure, run)
+	// app is the "plugin" instance of the value-transfers application.
+	app     *node.Plugin
+	appOnce sync.Once
 
-	// Tangle represents the value tangle that is used to express votes on value transactions.
-	Tangle *tangle.Tangle
+	// _tangle represents the value tangle that is used to express votes on value transactions.
+	_tangle    *tangle.Tangle
+	tangleOnce sync.Once
 
-	// LedgerState represents the ledger state, that keeps track of the liked branches and offers an API to access funds.
-	LedgerState *tangle.LedgerState
+	// fcob contains the fcob consensus logic.
+	fcob *consensus.FCOB
+
+	// ledgerState represents the ledger state, that keeps track of the liked branches and offers an API to access funds.
+	ledgerState *tangle.LedgerState
 
 	// log holds a reference to the logger used by this app.
 	log *logger.Logger
+
+	tipManager     *tipmanager.TipManager
+	tipManagerOnce sync.Once
+
+	valueObjectFactory     *tangle.ValueObjectFactory
+	valueObjectFactoryOnce sync.Once
 )
 
+// App gets the plugin instance.
+func App() *node.Plugin {
+	appOnce.Do(func() {
+		app = node.NewPlugin(PluginName, node.Enabled, configure, run)
+	})
+	return app
+}
+
+// Tangle gets the tangle instance.
+// tangle represents the value tangle that is used to express votes on value transactions.
+func Tangle() *tangle.Tangle {
+	tangleOnce.Do(func() {
+		_tangle = tangle.New(database.Store())
+	})
+	return _tangle
+}
+
+// FCOB gets the fcob instance.
+// fcob contains the fcob consensus logic.
+func FCOB() *consensus.FCOB {
+	return fcob
+}
+
+// LedgerState gets the ledgerState instance.
+// ledgerState represents the ledger state, that keeps track of the liked branches and offers an API to access funds.
+func LedgerState() *tangle.LedgerState {
+	return ledgerState
+}
+
 func configure(_ *node.Plugin) {
+	// configure logger
 	log = logger.NewLogger(PluginName)
 
-	log.Debug("configuring ValueTransfers")
+	// configure Tangle
+	_tangle = Tangle()
 
-	// create instances
-	Tangle = tangle.New(database.GetBadgerInstance())
+	// configure LedgerState
+	ledgerState = tangle.NewLedgerState(Tangle())
 
-	// subscribe to message-layer
-	messagelayer.Tangle.Events.MessageSolid.Attach(events.NewClosure(onReceiveMessageFromMessageLayer))
-
-	// setup behavior of package instances
-	Tangle.Events.TransactionBooked.Attach(events.NewClosure(onTransactionBooked))
-	Tangle.Events.Fork.Attach(events.NewClosure(onForkOfFirstConsumer))
-
-	configureFPC()
-	// TODO: DECIDE WHAT WE SHOULD DO IF FPC FAILS -> cry
-	// voter.Events().Failed.Attach(events.NewClosure(panic))
-	voter.Events().Finalized.Attach(events.NewClosure(func(id string, opinion vote.Opinion) {
-		branchID, err := branchmanager.BranchIDFromBase58(id)
+	// read snapshot file
+	snapshotFilePath := config.Node().GetString(CfgValueLayerSnapshotFile)
+	if len(snapshotFilePath) != 0 {
+		snapshot := tangle.Snapshot{}
+		f, err := os.Open(snapshotFilePath)
 		if err != nil {
-			log.Error(err)
-
-			return
+			log.Panic("can not open snapshot file:", err)
 		}
+		if _, err := snapshot.ReadFrom(f); err != nil {
+			log.Panic("could not read snapshot file:", err)
+		}
+		_tangle.LoadSnapshot(snapshot)
+		log.Infof("read snapshot from %s", snapshotFilePath)
+	}
 
-		switch opinion {
-		case vote.Like:
-			if _, err := Tangle.BranchManager().SetBranchPreferred(branchID, true); err != nil {
-				panic(err)
-			}
-			// TODO: merge branch mutations into the parent branch
-		case vote.Dislike:
-			if _, err := Tangle.BranchManager().SetBranchPreferred(branchID, false); err != nil {
-				panic(err)
-			}
-			// TODO: merge branch mutations into the parent branch / cleanup
+	_tangle.Events.Error.Attach(events.NewClosure(func(err error) {
+		log.Error(err)
+	}))
+
+	// initialize tip manager and value object factory
+	tipManager = TipManager()
+	valueObjectFactory = ValueObjectFactory()
+
+	_tangle.Events.PayloadLiked.Attach(events.NewClosure(func(cachedPayload *payload.CachedPayload, cachedMetadata *tangle.CachedPayloadMetadata) {
+		cachedMetadata.Release()
+		cachedPayload.Consume(tipManager.AddTip)
+	}))
+	_tangle.Events.PayloadDisliked.Attach(events.NewClosure(func(cachedPayload *payload.CachedPayload, cachedMetadata *tangle.CachedPayloadMetadata) {
+		cachedMetadata.Release()
+		cachedPayload.Consume(tipManager.RemoveTip)
+	}))
+
+	// configure FCOB consensus rules
+	cfgAvgNetworkDelay := config.Node().GetInt(CfgValueLayerFCOBAverageNetworkDelay)
+	log.Infof("avg. network delay configured to %d seconds", cfgAvgNetworkDelay)
+	fcob = consensus.NewFCOB(_tangle, time.Duration(cfgAvgNetworkDelay)*time.Second)
+	fcob.Events.Vote.Attach(events.NewClosure(func(id string, initOpn vote.Opinion) {
+		if err := voter.Vote(id, initOpn); err != nil {
+			log.Warnf("FPC vote: %s", err)
 		}
 	}))
+	fcob.Events.Error.Attach(events.NewClosure(func(err error) {
+		log.Errorf("FCOB error: %s", err)
+	}))
+
+	// configure FPC + link to consensus
+	configureFPC()
+	voter.Events().Finalized.Attach(events.NewClosure(fcob.ProcessVoteResult))
+	voter.Events().Finalized.Attach(events.NewClosure(func(ev *vote.OpinionEvent) {
+		log.Infof("FPC finalized for transaction with id '%s' - final opinion: '%s'", ev.ID, ev.Opinion)
+	}))
+	voter.Events().Failed.Attach(events.NewClosure(func(ev *vote.OpinionEvent) {
+		log.Warnf("FPC failed for transaction with id '%s' - last opinion: '%s'", ev.ID, ev.Opinion)
+	}))
+
+	// register SignatureFilter in Parser
+	messagelayer.MessageParser().AddMessageFilter(tangle.NewSignatureFilter())
+
+	// subscribe to message-layer
+	messagelayer.Tangle().Events.MessageSolid.Attach(events.NewClosure(onReceiveMessageFromMessageLayer))
 }
 
 func run(*node.Plugin) {
-	_ = daemon.BackgroundWorker("Tangle", func(shutdownSignal <-chan struct{}) {
+	if err := daemon.BackgroundWorker("ValueTangle", func(shutdownSignal <-chan struct{}) {
 		<-shutdownSignal
-		Tangle.Shutdown()
-	}, shutdown.PriorityTangle)
+		_tangle.Shutdown()
+	}, shutdown.PriorityTangle); err != nil {
+		log.Panicf("Failed to start as daemon: %s", err)
+	}
 
 	runFPC()
 }
@@ -98,103 +186,38 @@ func onReceiveMessageFromMessageLayer(cachedMessage *message.CachedMessage, cach
 
 	solidMessage := cachedMessage.Unwrap()
 	if solidMessage == nil {
-		// TODO: LOG ERROR?
+		log.Debug("failed to unpack solid message from message layer")
 
 		return
 	}
 
 	messagePayload := solidMessage.Payload()
 	if messagePayload.Type() != valuepayload.Type {
-		// TODO: LOG ERROR?
-
 		return
 	}
 
 	valuePayload, ok := messagePayload.(*valuepayload.Payload)
 	if !ok {
-		// TODO: LOG ERROR?
+		log.Debug("could not cast payload to value payload")
 
 		return
 	}
 
-	Tangle.AttachPayload(valuePayload)
+	_tangle.AttachPayload(valuePayload)
 }
 
-func onTransactionBooked(cachedTransaction *transaction.CachedTransaction, cachedTransactionMetadata *tangle.CachedTransactionMetadata, cachedBranch *branchmanager.CachedBranch, conflictingInputs []transaction.OutputID, decisionPending bool) {
-	defer cachedTransaction.Release()
-	defer cachedTransactionMetadata.Release()
-	defer cachedBranch.Release()
-
-	if len(conflictingInputs) >= 1 {
-		// abort if the previous consumers where finalized already
-		if !decisionPending {
-			return
-		}
-
-		branch := cachedBranch.Unwrap()
-		if branch == nil {
-			log.Error("failed to unpack branch")
-
-			return
-		}
-
-		err := voter.Vote(branch.ID().String(), vote.Dislike)
-		if err != nil {
-			log.Error(err)
-		}
-
-		return
-	}
-
-	// If the transaction is not conflicting, then we apply the fcob rule (we finalize after 2 network delays).
-	// Note: We do not set a liked flag after 1 network delay because that can be derived by the retriever later.
-	cachedTransactionMetadata.Retain()
-	time.AfterFunc(2*AverageNetworkDelay, func() {
-		defer cachedTransactionMetadata.Release()
-
-		transactionMetadata := cachedTransactionMetadata.Unwrap()
-		if transactionMetadata == nil {
-			return
-		}
-
-		// TODO: check that the booking goroutine in the UTXO DAG and this check is somehow synchronized
-		if transactionMetadata.BranchID() == branchmanager.NewBranchID(transactionMetadata.ID()) {
-			return
-		}
-
-		transactionMetadata.SetFinalized(true)
+// TipManager returns the TipManager singleton.
+func TipManager() *tipmanager.TipManager {
+	tipManagerOnce.Do(func() {
+		tipManager = tipmanager.New()
 	})
+	return tipManager
 }
 
-// TODO: clarify what we do here
-func onForkOfFirstConsumer(cachedTransaction *transaction.CachedTransaction, cachedTransactionMetadata *tangle.CachedTransactionMetadata, cachedBranch *branchmanager.CachedBranch, conflictingInputs []transaction.OutputID) {
-	defer cachedTransaction.Release()
-	defer cachedTransactionMetadata.Release()
-	defer cachedBranch.Release()
-
-	transactionMetadata := cachedTransactionMetadata.Unwrap()
-	if transactionMetadata == nil {
-		return
-	}
-
-	branch := cachedBranch.Unwrap()
-	if branch == nil {
-		return
-	}
-
-	if time.Since(transactionMetadata.SoldificationTime()) < AverageNetworkDelay {
-		if err := voter.Vote(branch.ID().String(), vote.Dislike); err != nil {
-			log.Error(err)
-		}
-
-		return
-	}
-
-	if _, err := Tangle.BranchManager().SetBranchPreferred(branch.ID(), true); err != nil {
-		log.Error(err)
-	}
-
-	if err := voter.Vote(branch.ID().String(), vote.Like); err != nil {
-		log.Error(err)
-	}
+// ValueObjectFactory returns the ValueObjectFactory singleton.
+func ValueObjectFactory() *tangle.ValueObjectFactory {
+	valueObjectFactoryOnce.Do(func() {
+		valueObjectFactory = tangle.NewValueObjectFactory(TipManager())
+	})
+	return valueObjectFactory
 }

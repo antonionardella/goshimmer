@@ -6,13 +6,14 @@
     "server": {
       "bindAddress": "0.0.0.0:16178"
     },
-    "webInterface": {
-      "bindAddress": "0.0.0.0:80"
+    "dashboard": {
+      "bindAddress": "0.0.0.0:8000",
+      "dev": false
     }
   },
   "autopeering": {
     "entryNodes": [
-      "MRCJTGX9x+PPiT3um1DQSHXvALaUg/tCH/oQr6mliGo=@35.246.104.243:14626"
+      "4JXbv7u61TPfDkN63KK2UxDquuKsewZBMnBujTvXnmHK@35.246.104.243:14626"
     ],
     "port": 14626
   },
@@ -59,6 +60,14 @@
     "disablePlugins": [],
     "enablePlugins": []
   },
+  "pow": {
+    "difficulty": 22,
+    "numThreads": 1,
+    "timeout": "1m"
+  },
+  "prometheus": {
+    "bindAddress": "127.0.0.1:9311"
+  },
   "webapi": {
     "auth": {
       "password": "goshimmer",
@@ -66,5 +75,8 @@
       "username": "goshimmer"
     },
     "bindAddress": "127.0.0.1:8080"
+  },
+  "networkdelay": {
+    "originPublicKey": "9DB3j9cWYSuEEtkvanrzqkzCQMdH1FGv3TawJdVbDxkd"
   }
 }

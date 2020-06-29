@@ -1,12 +1,13 @@
 package transaction
 
 import (
-	"github.com/iotaledger/hive.go/marshalutil"
+	"bytes"
+	"sort"
 
 	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/address"
-	"github.com/iotaledger/goshimmer/packages/binary/datastructure/orderedmap"
-
 	"github.com/iotaledger/goshimmer/dapps/valuetransfers/packages/balance"
+	"github.com/iotaledger/goshimmer/packages/binary/datastructure/orderedmap"
+	"github.com/iotaledger/hive.go/marshalutil"
 )
 
 // Outputs represents a list of Outputs that are part of a transaction.
@@ -16,11 +17,20 @@ type Outputs struct {
 
 // NewOutputs is the constructor of the Outputs struct and creates the list of Outputs from the given details.
 func NewOutputs(outputs map[address.Address][]*balance.Balance) (result *Outputs) {
-	result = &Outputs{orderedmap.New()}
-	for address, balances := range outputs {
-		result.Add(address, balances)
+	// sorting outputs first before adding to the ordered map to have a deterministic order
+	toSort := make([]address.Address, 0, len(outputs))
+	for a := range outputs {
+		toSort = append(toSort, a)
 	}
 
+	sort.Slice(toSort, func(i, j int) bool {
+		return bytes.Compare(toSort[i][:], toSort[j][:]) < 0
+	})
+
+	result = &Outputs{orderedmap.New()}
+	for _, addr := range toSort {
+		result.Add(addr, outputs[addr])
+	}
 	return
 }
 
@@ -49,7 +59,7 @@ func OutputsFromBytes(bytes []byte, optionalTargetObject ...*Outputs) (result *O
 	// iterate the corresponding times and collect addresses + their details
 	for i := uint32(0); i < addressCount; i++ {
 		// read address
-		address, addressErr := address.Parse(marshalUtil)
+		addr, addressErr := address.Parse(marshalUtil)
 		if addressErr != nil {
 			err = addressErr
 
@@ -78,7 +88,7 @@ func OutputsFromBytes(bytes []byte, optionalTargetObject ...*Outputs) (result *O
 		}
 
 		// add the gathered information as an output
-		result.Add(address, coloredBalances)
+		result.Add(addr, coloredBalances)
 	}
 
 	// return the number of bytes we processed
@@ -117,8 +127,8 @@ func (outputs *Outputs) Bytes() []byte {
 		marshalUtil.WriteBytes(address.Bytes())
 		marshalUtil.WriteUint32(uint32(len(balances)))
 
-		for _, balance := range balances {
-			marshalUtil.WriteBytes(balance.Bytes())
+		for _, bal := range balances {
+			marshalUtil.WriteBytes(bal.Bytes())
 		}
 
 		return true
@@ -141,10 +151,10 @@ func (outputs *Outputs) String() string {
 		result += "    " + address.String() + ": [\n"
 
 		balancesEmpty := true
-		for _, balance := range balances {
+		for _, bal := range balances {
 			balancesEmpty = false
 
-			result += "        " + balance.String() + ",\n"
+			result += "        " + bal.String() + ",\n"
 		}
 
 		if balancesEmpty {

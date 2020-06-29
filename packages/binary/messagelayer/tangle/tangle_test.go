@@ -2,40 +2,27 @@ package tangle
 
 import (
 	"fmt"
-	"io/ioutil"
-	"os"
 	"testing"
 	"time"
 
-	"github.com/iotaledger/hive.go/events"
-	"github.com/iotaledger/hive.go/identity"
-	"github.com/stretchr/testify/require"
-
 	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/message"
 	"github.com/iotaledger/goshimmer/packages/binary/messagelayer/payload"
-	"github.com/iotaledger/goshimmer/packages/database"
-	"github.com/iotaledger/goshimmer/plugins/config"
+	"github.com/iotaledger/hive.go/crypto/ed25519"
+	"github.com/iotaledger/hive.go/events"
+	"github.com/iotaledger/hive.go/kvstore/mapdb"
 )
 
 func BenchmarkTangle_AttachMessage(b *testing.B) {
-	dir, err := ioutil.TempDir("", b.Name())
-	require.NoError(b, err)
-	defer os.Remove(dir)
-	// use the tempdir for the database
-	config.Node.Set(database.CFG_DIRECTORY, dir)
-
-	tangle := New(database.GetBadgerInstance())
+	tangle := New(mapdb.NewMapDB())
 	if err := tangle.Prune(); err != nil {
 		b.Error(err)
 
 		return
 	}
 
-	testIdentity := identity.GenerateLocalIdentity()
-
 	messageBytes := make([]*message.Message, b.N)
 	for i := 0; i < b.N; i++ {
-		messageBytes[i] = message.New(message.EmptyId, message.EmptyId, testIdentity, time.Now(), 0, payload.NewData([]byte("some data")))
+		messageBytes[i] = newTestMessage("some data")
 		messageBytes[i].Bytes()
 	}
 
@@ -49,13 +36,7 @@ func BenchmarkTangle_AttachMessage(b *testing.B) {
 }
 
 func TestTangle_AttachMessage(t *testing.T) {
-	dir, err := ioutil.TempDir("", t.Name())
-	require.NoError(t, err)
-	defer os.Remove(dir)
-	// use the tempdir for the database
-	config.Node.Set(database.CFG_DIRECTORY, dir)
-
-	messageTangle := New(database.GetBadgerInstance())
+	messageTangle := New(mapdb.NewMapDB())
 	if err := messageTangle.Prune(); err != nil {
 		t.Error(err)
 
@@ -90,10 +71,8 @@ func TestTangle_AttachMessage(t *testing.T) {
 		fmt.Println("REMOVED:", messageId)
 	}))
 
-	localIdentity1 := identity.GenerateLocalIdentity()
-	localIdentity2 := identity.GenerateLocalIdentity()
-	newMessageOne := message.New(message.EmptyId, message.EmptyId, localIdentity1, time.Now(), 0, payload.NewData([]byte("some data")))
-	newMessageTwo := message.New(newMessageOne.Id(), newMessageOne.Id(), localIdentity2, time.Now(), 0, payload.NewData([]byte("some other data")))
+	newMessageOne := newTestMessage("some data")
+	newMessageTwo := newTestMessage("some other data")
 
 	messageTangle.AttachMessage(newMessageTwo)
 
@@ -102,4 +81,8 @@ func TestTangle_AttachMessage(t *testing.T) {
 	messageTangle.AttachMessage(newMessageOne)
 
 	messageTangle.Shutdown()
+}
+
+func newTestMessage(payloadString string) *message.Message {
+	return message.New(message.EmptyId, message.EmptyId, time.Now(), ed25519.PublicKey{}, 0, payload.NewData([]byte(payloadString)), 0, ed25519.Signature{})
 }
